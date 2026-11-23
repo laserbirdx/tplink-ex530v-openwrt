@@ -1,0 +1,361 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later OR MIT */
+/dts-v1/;
+
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include "en7523.dtsi"
+
+/ {
+	model = "TP-Link ex530v v1";
+	compatible = "tplink,ex530v-v1", "airoha,en7523";
+
+	chosen {
+		bootargs = "console=ttyS0,115200 earlycon=uart8250,mmio32,0x1fbf0000 loglevel=8";
+		stdout-path = "serial0:115200n8";
+	};
+
+	aliases {
+		serial0 = &uart1;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-upgrade = &led_power;
+		led-running = &led_power;
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&pinctrl 26 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+
+		wps {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&pinctrl 7 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		/* Power */
+		led_power: led@11 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
+			function-enumerator = <11>;
+			gpios = <&pinctrl 11 GPIO_ACTIVE_LOW>;
+		};
+
+		/* Internet Status - Red */
+		led@10 {
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_WAN;
+			function-enumerator = <10>;
+			gpios = <&pinctrl 10 GPIO_ACTIVE_LOW>;
+		};
+
+		/* Internet Status - Blue*/
+		led@1 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_WAN_ONLINE;
+			function-enumerator = <1>;
+			gpios = <&pinctrl 1 GPIO_ACTIVE_LOW>;
+		};
+
+		/* WIFI */
+		led@6 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_WLAN;
+			function-enumerator = <6>;
+			gpios = <&pinctrl 6 GPIO_ACTIVE_LOW>;
+		};
+
+		/* LAN */
+		led@3 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <3>;
+			gpios = <&pinctrl 3 GPIO_ACTIVE_HIGH>;
+		};
+
+		/* USB */
+		led@4 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_USB;
+			function-enumerator = <4>;
+			gpios = <&pinctrl 4 GPIO_ACTIVE_HIGH>;
+		};
+
+		/* FXS1 */
+		led@5 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
+			function-enumerator = <5>;
+			gpios = <&pinctrl 5 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+/*
+Old maping NAND
+
+	0x000000000000-0x000000080000 : "boot"
+	0x000000080000-0x0000000c0000 : "romfile"
+	0x0000000c0000-0x0000004c0000 : "misc" => 0x400000
+	0x0000004c0000-0x000002cc0000 : "firmware"
+	0x000002cc0000-0x0000054c0000 : "firmware_slave"
+	0x000005940000-0x000005980000 : "reserve"
+	0x000006000000-0x000012800000 : "container"
+
+---------------------------------------------------------------------
+
+New Maping:
+	0x00000000-0x00100000 : BL1 + FIP (BL2 + BL31 + BL33)
+	0x00100000-           : UBI (uboot env{1,2} + ART (misc part) + fit (firmware))
+*/
+&spi0 {
+	flash@0 {
+		reg = <0>;
+		compatible = "spi-nand";
+		spi-max-frequency = <50000000>;
+		spi-tx-bus-width = <1>;
+		spi-rx-bus-width = <2>;
+
+		/*
+		 * STOCK TP-Link layout, verified on this unit (raw reads == backups, 0 bad
+		 * blocks, vendor BMT has remapped nothing in 0x0..0x5980000). EVERYTHING
+		 * read-only: the initramfs must never write the stock flash.
+		 * 0x5980000..end is unmapped; the vendor BMT pool lives at the very end.
+		 */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "boot";
+				reg = <0x0 0x80000>;
+				read-only;
+			};
+
+			partition@80000 {
+				label = "romfile";
+				reg = <0x80000 0x40000>;
+				read-only;
+			};
+
+			partition@c0000 {
+				label = "misc";
+				reg = <0xc0000 0x400000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr: macaddr@8f100 {
+						compatible = "mac-base";
+						reg = <0x8f100 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+
+					/* MT7916 calibration, chip id 0x7916 at +0 */
+					eeprom0: eeprom@100000 {
+						reg = <0x100000 0x1000>;
+					};
+				};
+			};
+
+			partition@4c0000 {
+				label = "stock_kernel";
+				reg = <0x4c0000 0x800000>;
+				read-only;
+			};
+
+			partition@cc0000 {
+				label = "stock_rootfs";
+				reg = <0xcc0000 0x2000000>;
+				read-only;
+			};
+
+			/* Slot B (image1) of the vendor dual-image scheme: OpenWrt kernel.
+			 * U-Boot "flash tpimg" loads it when bootflag == 1: 0x200 byte
+			 * TP header (LE magic 0x03000003 @0, LE FIT size @0x78) + FIT.
+			 */
+			partition@2cc0000 {
+				label = "kernel";
+				reg = <0x2cc0000 0x800000>;
+			};
+
+			partition@34c0000 {
+				label = "stock_rootfs_slave";
+				reg = <0x34c0000 0x2000000>;
+				read-only;
+			};
+
+			/* Vendor boot flag read by "flash tpimg": 8 bytes, byte 7 =
+			 * sum of bytes 0..6, image1 (slot B) when bytes 4 and 5 are
+			 * non-zero. Written by sysupgrade (ex530v_set_bootflag) or by
+			 * "flash bflag 0|1" in U-Boot.
+			 */
+			partition@5940000 {
+				label = "reserve";
+				reg = <0x5940000 0x40000>;
+			};
+
+			/* Unused by stock firmware (verified erased, no bad blocks).
+			 * Ends at the vendor bootflag block. 0x1c000000..0x1d740000 is
+			 * left unmapped; the U-Boot BMT pool (0x1d740000..end: RAWB
+			 * table first, BMT table in the last block) must never be
+			 * written.
+			 */
+			partition@5980000 {
+				label = "ubi";
+				reg = <0x5980000 0x16640000>;
+			};
+
+			/* Vendor bootflag ("bootflag swap" prints boot_flag_addr
+			 * 0x1bfc0000): 8 bytes, byte 7 = sum of bytes 0..6.
+			 * image1 (slot B, OpenWrt): 00 00 00 01 01 01 00 03
+			 * image0 (slot A, stock):   01 01 01 00 00 00 00 03
+			 */
+			partition@1bfc0000 {
+				label = "bootflag";
+				reg = <0x1bfc0000 0x40000>;
+			};
+		};
+	};
+};
+
+/* pinctrl-en7523.c has no AIROHA_PINCTRL_CONFS_PCIE_RST_OD table, so the dtsi's
+ * drive-open-drain conf returns -EINVAL ("pin_config_set op failed for pin 40/41")
+ * and the driver core aborts before mtk-pcie probe() ever runs. Keep the mux only. */
+&pcie0_rst_pins {
+	/delete-node/ conf;
+};
+
+&pcie1_rst_pins {
+	/delete-node/ conf;
+};
+
+&pcie0 {
+	status = "okay";
+};
+
+&pcie1 {
+	status = "okay";
+};
+
+&pcie1_slot1 {
+	mt7915@0,0 {
+		reg = <0x0000 0 0 0 0>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		airoha,npu = <&npu>;
+		airoha,eth = <&eth>;
+		nvmem-cells = <&eeprom0>;
+		nvmem-cell-names = "eeprom";
+
+		/* 2.4 GHz */
+		band@0 {
+			reg = <0>;
+			nvmem-cells = <&macaddr 0>;
+			nvmem-cell-names = "mac-address";
+		};
+
+		/* 5 GHz */
+		band@1 {
+			reg = <1>;
+			nvmem-cells = <&macaddr 2>;
+			nvmem-cell-names = "mac-address";
+		};
+	};
+};
+
+&uart1 {
+	/* mainline en7523.dtsi value; the fork's 20 MHz makes the 8250 core
+	 * write BRDL=11 and silently drop the UART to ~10 kbaud */
+	clock-frequency = <1843200>;
+};
+
+&pciephy {
+	/* phy-airoha-pcie.c looks up the underscore spelling */
+	airoha,chip_scu = <&chip_scu>;
+};
+
+&npu {
+	status = "disabled";
+};
+
+&usb0 {
+	status = "okay";
+};
+
+&i2c0 {
+	status = "disabled";
+};
+
+&xpon {
+	status = "disabled";
+};
+
+&eth {
+	status = "okay";
+};
+
+&gdm1 {
+	status = "okay";
+	nvmem-cells = <&macaddr 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+&switch {
+	status = "okay";
+};
+
+&gsw_port1 {
+	label = "wan";
+	status = "okay";
+};
+
+&gsw_port2 {
+	label = "lan3";
+	status = "okay";
+};
+
+&gsw_port3 {
+	label = "lan2";
+	status = "okay";
+};
+
+&gsw_port4 {
+	label = "lan1";
+	status = "okay";
+};
+
+&gsw_port6 {
+};
+
+&gsw_phy1 {
+	status = "okay";
+};
+
+&gsw_phy2 {
+	status = "okay";
+};
+
+&gsw_phy3 {
+	status = "okay";
+};
+
+&gsw_phy4 {
+	status = "okay";
+};

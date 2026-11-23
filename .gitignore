@@ -1,0 +1,6 @@
+*.bin
+*.itb
+*.squashfs
+*.img
+*.tar.gz
+.DS_Store

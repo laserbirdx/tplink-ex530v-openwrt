@@ -1,0 +1,297 @@
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+index 118e3ce..d2b1af9 100644
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -477,10 +477,6 @@ endif
+ ifdef CONFIG_PACKAGE_kmod-mt7915e
+   PKG_MAKE_FLAGS += CONFIG_MT7915E=m
+   ifdef CONFIG_TARGET_airoha_en7523
+-    PKG_MAKE_FLAGS += CONFIG_MT76_NPU=y
+-    PKG_MAKE_FLAGS += CONFIG_MT7915_NPU=y
+-    NOSTDINC_FLAGS += -DCONFIG_MT76_NPU
+-    NOSTDINC_FLAGS += -DCONFIG_MT7915_NPU
+   endif
+   ifdef CONFIG_TARGET_mediatek_filogic
+     PKG_MAKE_FLAGS += CONFIG_MT798X_WMAC=y
+diff --git a/target/linux/airoha/Makefile b/target/linux/airoha/Makefile
+index 7aa7b5c..aca680b 100644
+--- a/target/linux/airoha/Makefile
++++ b/target/linux/airoha/Makefile
+@@ -9,7 +9,6 @@ KERNEL_PATCHVER:=6.18
+ 
+ include $(INCLUDE_DIR)/target.mk
+ DEFAULT_PACKAGES += \
+-	kmod-leds-gpio kmod-gpio-button-hotplug nand-utils \
+-	xpon-agent
++	kmod-leds-gpio kmod-gpio-button-hotplug nand-utils
+ 
+ $(eval $(call BuildTarget))
+diff --git a/target/linux/airoha/en7523/base-files/etc/board.d/02_network b/target/linux/airoha/en7523/base-files/etc/board.d/02_network
+index 47319a3..9856fac 100644
+--- a/target/linux/airoha/en7523/base-files/etc/board.d/02_network
++++ b/target/linux/airoha/en7523/base-files/etc/board.d/02_network
+@@ -41,7 +41,7 @@ setup_interfaces()
+     ucidef_set_interfaces_lan_wan "lan2 lan3 lan4 lan5" "wan sfp"
+     ;;
+   tplink,ex530v-v1)
+-    ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
++    ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+     ;;
+   *)
+     echo "Unsupported hardware. Network interfaces not initialized"
+diff --git a/target/linux/airoha/en7523/base-files/lib/upgrade/platform.sh b/target/linux/airoha/en7523/base-files/lib/upgrade/platform.sh
+index 7b4db5e..0c39a73 100644
+--- a/target/linux/airoha/en7523/base-files/lib/upgrade/platform.sh
++++ b/target/linux/airoha/en7523/base-files/lib/upgrade/platform.sh
+@@ -70,10 +70,87 @@ platform_do_upgrade_mikrotik_nand() {
+ 	nand_do_upgrade "$image"
+ }
+ 
++# Vendor U-Boot ("flash tpimg") picks the slot from 8 bytes at the start of
++# the "reserve" partition: image1 (slot B) when bytes 4 and 5 are non-zero,
++# byte 7 = sum of bytes 0..6. Erased or invalid -> image0 (stock, slot A).
++# Same as "flash bflag 1" at the U-Boot prompt. Only called after the new
++# firmware has been written successfully.
++ex530v_bootflag_is_b() {
++  local dev="$1" b sum=0 i=0 b4 b5 b7
++
++  for b in $(dd if="$dev" bs=8 count=1 2>/dev/null | hexdump -v -e '8/1 "%u "'); do
++    [ $i -lt 7 ] && sum=$((sum + b))
++    [ $i -eq 4 ] && b4=$b
++    [ $i -eq 5 ] && b5=$b
++    [ $i -eq 7 ] && b7=$b
++    i=$((i + 1))
++  done
++  [ "$i" -eq 8 ] && [ "$b4" -ne 0 ] && [ "$b5" -ne 0 ] && [ $((sum & 255)) -eq "$b7" ]
++}
++
++ex530v_set_bootflag() {
++  local mtdnum="$(find_mtd_index reserve)"
++  local dev="/dev/mtd$mtdnum" img=/tmp/ex530v-bootflag.bin
++
++  [ -n "$mtdnum" ] || {
++    echo "cannot find reserve partition, boot flag not set"
++    return 1
++  }
++  ex530v_bootflag_is_b "$dev" && return 0
++
++  echo "setting vendor boot flag to slot B (image1)"
++  # keep the rest of the 256 KiB block as it is
++  {
++    printf '\000\000\000\001\001\001\000\003'
++    dd if="$dev" bs=8 skip=1 count=511 2>/dev/null
++    dd if="$dev" bs=4096 skip=1 count=63 2>/dev/null
++  } > "$img"
++  mtd write "$img" reserve && ex530v_bootflag_is_b "$dev" || {
++    echo "WARNING: boot flag not set, run 'flash bflag 1' in U-Boot"
++    return 1
++  }
++}
++
++# First install: the "ubi" area is erased flash on a stock unit. UBI attaches
++# empty flash without writing EC headers to every PEB, which leaves PEB 0 blank,
++# and the kernel's UBI auto-attach (it checks for "UBI#" at the start of the
++# partition) then never attaches it -> no root fs. Format it properly first.
++ex530v_format_ubi() {
++  local mtdnum="$(find_mtd_index ubi)"
++
++  [ -n "$mtdnum" ] || {
++    echo "cannot find ubi partition"
++    return 1
++  }
++  # look at the flash, not at the attach state: an attached UBI on flash that
++  # was erased behind its back must be re-formatted too
++  [ "$(dd if=/dev/mtd$mtdnum bs=4 count=1 2>/dev/null)" = "UBI#" ] && return 0
++
++  echo "ubi partition is not UBI formatted, running ubiformat"
++  if [ -n "$(nand_find_ubi ubi)" ]; then
++    ubidetach -m "$mtdnum" || {
++      echo "cannot detach ubi partition"
++      return 1
++    }
++  fi
++  ubiformat /dev/mtd$mtdnum -y -q
++}
++
+ platform_do_upgrade() {
+   local board=$(board_name)
+ 
+   case "$board" in
++  tplink,ex530v-v1)
++    # raw kernel in "kernel" (vendor slot B), squashfs + rootfs_data in "ubi"
++    CI_KERNPART=kernel
++    CI_UBIPART=ubi
++    CI_ROOTPART=rootfs
++    ex530v_format_ubi || return 1
++    sync
++    nand_do_flash_file "$1" || nand_do_upgrade_failed
++    ex530v_set_bootflag
++    nand_do_upgrade_success
++    ;;
+   askey,rtf8225vw |\
+   genexis,arcee |\
+   genexis,e650 |\
+@@ -82,7 +159,6 @@ platform_do_upgrade() {
+   genexis,rodimus_r1 |\
+   genexis,zephyr |\
+   mitrastar,gpt-2742gx4x5v6 |\
+-  tplink,ex530v-v1 |\
+   tplink,xx230v-v1)
+     fit_do_upgrade "$1"
+     ;;
+@@ -98,11 +174,37 @@ platform_do_upgrade() {
+   sync
+ }
+ 
++ex530v_check_image() {
++  local file="$1"
++  local board_dir magic
++
++  nand_do_platform_check "tplink,ex530v-v1" "$file" || return 1
++
++  board_dir="$(tar tf "$file" | grep -m 1 '^sysupgrade-.*/$')"
++  board_dir="${board_dir%/}"
++  [ -n "$board_dir" ] || {
++    echo "Not a NAND sysupgrade tar"
++    return 1
++  }
++
++  # vendor U-Boot ("flash tpimg") only boots slot B with this header magic
++  magic="$(tar xOf "$file" "$board_dir/kernel" 2>/dev/null | head -c 4 | hexdump -v -e '1/1 "%02x"')"
++  [ "$magic" = "03000003" ] || {
++    echo "Kernel has no TP-Link slot header (magic '$magic'), refusing"
++    return 1
++  }
++  return 0
++}
++
+ platform_check_image() {
+   local board=$(board_name)
+   [ "$#" -gt 1 ] && return 1
+ 
+   case "$board" in
++  tplink,ex530v-v1)
++    ex530v_check_image "$1"
++    return $?
++    ;;
+   askey,rtf8225vw |\
+   genexis,arcee |\
+   genexis,e650 |\
+@@ -111,7 +213,6 @@ platform_check_image() {
+   genexis,rodimus_r1 |\
+   genexis,zephyr |\
+   mitrastar,gpt-2742gx4x5v6 |\
+-  tplink,ex530v-v1 |\
+   tplink,xx230v-v1)
+     fit_check_image "$1"
+     return $?
+diff --git a/target/linux/airoha/en7523/config-6.18 b/target/linux/airoha/en7523/config-6.18
+index 48f85b9..fbeec78 100644
+--- a/target/linux/airoha/en7523/config-6.18
++++ b/target/linux/airoha/en7523/config-6.18
+@@ -62,8 +62,8 @@ CONFIG_BUFFER_HEAD=y
+ CONFIG_CACHE_L2X0=y
+ CONFIG_CC_HAVE_STACKPROTECTOR_TLS=y
+ CONFIG_CLONE_BACKWARDS=y
+-CONFIG_CMDLINE="rootfstype=squashfs,jffs2"
+-CONFIG_CMDLINE_FROM_BOOTLOADER=y
++CONFIG_CMDLINE="console=ttyS0,115200 earlycon=uart8250,mmio32,0x1fbf0000 rootfstype=squashfs,jffs2"
++CONFIG_CMDLINE_FORCE=y
+ CONFIG_COMMON_CLK=y
+ CONFIG_COMMON_CLK_EN7523=y
+ CONFIG_COMPACT_UNEVICTABLE_DEFAULT=1
+@@ -148,7 +148,7 @@ CONFIG_DMA_OF=y
+ CONFIG_DMA_OPS_HELPERS=y
+ CONFIG_DMA_VIRTUAL_CHANNELS=y
+ CONFIG_DTC=y
+-# CONFIG_EARLY_PRINTK is not set
++CONFIG_EARLY_PRINTK=y
+ CONFIG_EDAC_ATOMIC_SCRUB=y
+ CONFIG_EDAC_SUPPORT=y
+ CONFIG_EN7570_PHY=y
+@@ -466,3 +466,4 @@ CONFIG_ZLIB_INFLATE=y
+ CONFIG_ZSTD_COMMON=y
+ CONFIG_ZSTD_COMPRESS=y
+ CONFIG_ZSTD_DECOMPRESS=y
++# CONFIG_AIROHA_XPON_V1 is not set
+diff --git a/target/linux/airoha/image/en7523.mk b/target/linux/airoha/image/en7523.mk
+index ad056ee..d0f15f9 100644
+--- a/target/linux/airoha/image/en7523.mk
++++ b/target/linux/airoha/image/en7523.mk
+@@ -143,14 +143,39 @@ define Device/skyworth_gn630v
+ endef
+ TARGET_DEVICES += skyworth_gn630v
+ 
++# TP-Link vendor U-Boot ("flash tpimg") image for the raw slot B kernel
++# partition: 0x200 byte header, LE magic 0x03000003 at 0x0 and LE payload (FIT)
++# size at 0x78; nothing else is checked. Then "bootm 81800200" boots the FIT.
++define Build/ex530v-tp-header
++	perl -e 'my $$n = -s $$ARGV[0]; print pack("V", 0x03000003), "\0" x 0x74, pack("V", $$n), "\0" x (0x200 - 0x7c)' $@ > $@.new
++	cat $@ >> $@.new
++	mv $@.new $@
++endef
++
++# Stock layout is kept: OpenWrt goes into the empty vendor slot B. The kernel
++# (TP header + FIT) is written raw into the "kernel" partition (0x2cc0000),
++# root squashfs + rootfs_data live in the "ubi" partition. sysupgrade.bin is a
++# standard OpenWrt NAND tar (kernel + root) handled by nand_do_upgrade.
+ define Device/tplink_ex530v-v1
+-  $(Device/Uboot-FitImage)
+   DEVICE_VENDOR := TP-Link
+   DEVICE_MODEL := ex530v
+   DEVICE_VARIANT := v1
++  KERNEL_LOADADDR := 0x80088000
++  KERNEL_NAME := Image
++  BLOCKSIZE := 256k
++  PAGESIZE := 4096
++  KERNEL_SIZE := 8192k
++  KERNEL := kernel-bin | lzma | \
++    fit lzma $$(KDIR)/image-$$(DEVICE_DTS).dtb | ex530v-tp-header
++  KERNEL_INITRAMFS := kernel-bin | lzma | \
++    fit lzma $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd | pad-to 128k
++  IMAGES := sysupgrade.bin slotb-kernel.bin rootfs.squashfs
++  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
++  IMAGE/slotb-kernel.bin := append-kernel | check-size $$$$(KERNEL_SIZE)
++  IMAGE/rootfs.squashfs := append-rootfs
+   DEVICE_PACKAGES += kmod-usb-ohci kmod-usb3 \
+                      hostapd-mbedtls wpa-supplicant-mbedtls \
+-                     kmod-mt7915e kmod-mt7916-firmware  airoha-en7523-kite-npu-firmware
++                     kmod-mt7915e kmod-mt7916-firmware
+ endef
+ TARGET_DEVICES += tplink_ex530v-v1
+ 
+diff --git a/target/linux/airoha/patches-6.18/999-arm-airoha-en7523-text-offset-above-atf.patch b/target/linux/airoha/patches-6.18/999-arm-airoha-en7523-text-offset-above-atf.patch
+new file mode 100644
+index 0000000..ce4ca11
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/999-arm-airoha-en7523-text-offset-above-atf.patch
+@@ -0,0 +1,29 @@
++From: Mehmet Salih <salihmehmet497@gmail.com>
++Subject: ARM: airoha: link the kernel 0x88000 into DRAM to keep clear of ATF
++
++On EN7523 boards the vendor boot chain (BL2 -> BL32/sp_min -> U-Boot) leaves
++the AArch32 Trusted Firmware runtime resident at the very start of DRAM
++(vendor DT: atf-reserved-memory@80000000, 0x40000 bytes, no-map). With the
++default TEXT_OFFSET of 0x8000 the raw kernel Image lands at 0x80008000 and
++overwrites it, so the first PSCI SMC ("psci: probing for conduit method
++from DT") jumps into kernel text and the boot locks up hard -- which is
++exactly what was observed on the Zyxel EX3501-T0 and mis-diagnosed as
++"this U-Boot has no PSCI conduit". The vendor kernel is linked at
++PAGE_OFFSET + 0x88000 (virt 0xC0088000, phys 0x80088000) for this reason.
++
++Use the same text offset for ARCH_AIROHA so head.S still derives
++PHYS_OFFSET = 0x80000000 from the 0x80088000 load address, and the EL3
++runtime survives. Pair with KERNEL_LOADADDR := 0x80088000 in the image
++recipe and re-enable the psci node / cpu enable-method in the board DT.
++
++--- a/arch/arm/Makefile
+++++ b/arch/arm/Makefile
++@@ -160,6 +160,8 @@
++ # during boot, and this offset is critical to the functioning of
++ # kexec-tools.
++ textofs-y	:= 0x00008000
+++# Airoha EN7523: keep the kernel above the resident AArch32 TF-A (sp_min)
+++textofs-$(CONFIG_ARCH_AIROHA) := 0x00088000
++ # RTD1195 has Boot ROM at start of address space
++ textofs-$(CONFIG_ARCH_REALTEK)  := 0x00108000
++ # SA1111 DMA bug: we don't want the kernel to live in precious DMA-able memory
