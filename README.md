@@ -15,7 +15,8 @@ OpenWrt port for the TP-Link EX530v v1 (AX3000 Wi-Fi 6 router, Airoha / EcoNet E
 OpenWrt is installed into the **empty second firmware slot** and an unused NAND area, so
 the stock firmware stays on the device and can be booted again with one U-Boot command.
 
-Working: 3x LAN + WAN (Gigabit), Wi-Fi 2.4 GHz + 5 GHz (HE160), LuCI, USB storage, correct
+Working: 3x LAN + WAN (Gigabit), Wi-Fi 2.4 GHz (HE40) + 5 GHz (HE160), LuCI, USB storage, LEDs,
+buttons, CPU temperature, correct
 MAC address and Wi-Fi calibration from flash, wired hardware NAT (PPE flow offload), Wi-Fi
 offload the way the stock firmware does it (PPE -> WDMA -> WED for downloads, NPU for Wi-Fi
 RX), sysupgrade (also from LuCI), boot from flash without a PC.
@@ -49,14 +50,29 @@ data from `misc` + `0x100000` (4 KiB). Nothing unit-specific has to be copied by
 | Boot from flash (slot B), root on UBI, overlay on UBIFS | ✅ |
 | sysupgrade (CLI and LuCI, settings kept) | ✅ |
 | LAN 1-3 / WAN | ✅ |
-| Wi-Fi 2.4 GHz (HE20) / 5 GHz (HE160, 2401 Mbit/s link) | ✅ |
+| Wi-Fi 2.4 GHz (HE40) / 5 GHz (HE160, 2401 Mbit/s link) | ✅ |
 | Wired NAT hardware offload (PPE) | ✅ ~890 Mbit/s routed, CPU 1-7 % |
 | Wi-Fi download offload (PPE -> WDMA -> WED) | ✅ ~100 MB/s to a 5 GHz client, CPU 6-12 % |
+| Wi-Fi upload offload (NPU -> PPE) | ✅ ~58 MB/s from a 5 GHz client, CPU ~6 % |
+| 2.4 GHz (HE40, macOS client at 20 MHz) | ✅ 20 MB/s down / 18 MB/s up, CPU ~7 % |
 | NPU (4x RV32, OpenNPU firmware) | ✅ Wi-Fi RX offload for the MT7916 |
 | USB storage (ext4, vfat, exFAT, NTFS3) | ✅ |
 | LuCI | ✅ |
 | xPON | disabled |
-| LEDs, buttons | not tested |
+| LEDs | ✅ all |
+| Buttons (`reset` GPIO 26, `wps` GPIO 7) | ✅ press / release / hold time |
+| CPU temperature (`thermal_zone0`) | ✅ ~78 °C idle, ~82 °C at full load |
+| CPU frequency scaling | ✅ `cpufreq-dt`, 500-1000 MHz, `ondemand` |
+
+## LEDs, buttons, temperature
+
+- LEDs (`/sys/class/leds`): `blue:status-5`, `blue:status-11`, `blue:wan-online-1`,
+  `red:wan-10`, `blue:lan-3`, `blue:wlan-6`, `blue:usb-4` (suffix = GPIO). All work.
+- Buttons (`gpio-keys-polled`): `reset` (GPIO 26, `KEY_RESTART`: short press reboots, > 5 s
+  factory reset) and `wps` (GPIO 7). Both report press, release and hold time.
+- CPU temperature: `cat /sys/class/thermal/thermal_zone0/temp` (m°C). Uses the stock
+  firmware's formula and its default calibration, so the absolute value can be a few
+  degrees off; the Wi-Fi chip reports its own in `/sys/class/hwmon/hwmon*/temp1_input`.
 
 ## Default configuration of the release image
 
@@ -65,7 +81,7 @@ data from `misc` + `0x100000` (4 KiB). Nothing unit-specific has to be copied by
 | LAN | `lan1`..`lan3`, `192.168.1.1`, DHCP server |
 | WAN | `wan` port, DHCP client |
 | Login | `root`, **no password** |
-| Wi-Fi | **enabled and open (no password)**: `EX530v-OpenWrt-2G` (ch 1, HE20) and `EX530v-OpenWrt-5G` (ch 36, HE160), country `TR` |
+| Wi-Fi | **enabled and open (no password)**: `EX530v-OpenWrt-2G` (ch 1, HE40, `noscan=1`) and `EX530v-OpenWrt-5G` (ch 36, HE160), country `TR` |
 | Flow offload | software + hardware flow offloading enabled |
 | Wi-Fi offload | `options mt7915e wed_enable=1` (WED on, required by the NPU), NPU firmware `en7523_kite_npu_*.bin` |
 
@@ -257,6 +273,7 @@ The release was built from the
    - `9993` NPU: allow `HWNAT_INIT` for the OpenNPU firmware
    - `9994` reserve QDMA0 TX ring 6 / TX IRQ queue 1 for the NPU
    - `9995` PPE -> WDMA -> WED binding with the stock WHNAT FOE layout (runtime knobs)
+   - `9996` thermal: register the EN7523 zone, fix its probe, stock temperature formula
    - mt76 `0302` (NPU build fixes), mac80211 `423` (forward path for APs without a
      hardware path)
 3. Optional: copy [`files/`](files) to the tree root for the defaults listed above.

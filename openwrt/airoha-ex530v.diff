@@ -1,4 +1,3 @@
- A target/linux/airoha/patches-6.18/9995-net-airoha-en7523-whnat-wifi-flows-ppe-wdma-wed.patch
 diff --git a/package/kernel/mac80211/patches/subsys/423-mac80211-fill-forward-path-for-AP-without-hardware-path.patch b/package/kernel/mac80211/patches/subsys/423-mac80211-fill-forward-path-for-AP-without-hardware-path.patch
 new file mode 100644
 index 0000000..d22e28a
@@ -1074,3 +1073,69 @@ index 0000000..196d90d
 + 		airoha_ppe_en7523_wifi_odev_add(eth->ppe, odev);
 + 
 + 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
+diff --git a/target/linux/airoha/patches-6.18/9996-thermal-airoha-en7523-register-the-zone.patch b/target/linux/airoha/patches-6.18/9996-thermal-airoha-en7523-register-the-zone.patch
+new file mode 100644
+index 0000000..4d757c6
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/9996-thermal-airoha-en7523-register-the-zone.patch
+@@ -0,0 +1,60 @@
++--- a/drivers/thermal/airoha_thermal.c	2026-11-24 09:33:12.858925952 +0300
+++++ b/drivers/thermal/airoha_thermal.c	2026-11-24 09:53:36.750105978 +0300
++@@ -192,6 +192,7 @@
++ #define EN7581_SLOPE_X100_DIO_AVS		5645
++ #define EN7523_SLOPE_E2				0x712
++ #define EN7523_SLOPE_E3				0x6d6
+++#define EN7523_STOCK_TADC_CAL		0x86d3
++ 
++ #define EN7581_INIT_TEMP_CPK_X10		300
++ #define EN7581_INIT_TEMP_FTK_X10		620
++@@ -794,17 +795,17 @@
++ 
++ 	// set_chip_scu_data(EN7523_MUX_TADC,  (get_chip_scu_data(EN7523_MUX_TADC) &(~(0x1 <<7)) ) | (0x0<<7) );
++ 	regmap_read(priv->chip_scu, EN7523_MUX_TADC, &val);
++-	val &= (~(0x1 <<7)) | (0x0<<7);
+++	val = (val & ~(0x1 << 7)) | (0x0 << 7);
++ 	regmap_write(priv->chip_scu, EN7523_MUX_TADC, val);
++ 
++ 	// set_chip_scu_data(EN7523_MUX_TADC,  (get_chip_scu_data(EN7523_MUX_TADC) &(~(0x1 <<7)) ) | (0x1<<7) );
++ 	regmap_read(priv->chip_scu, EN7523_MUX_TADC, &val);
++-	val &= (~(0x1 <<7)) | (0x1<<7);
+++	val = (val & ~(0x1 << 7)) | (0x1 << 7);
++ 	regmap_write(priv->chip_scu, EN7523_MUX_TADC, val);
++ 
++ 	// set_chip_scu_data(EN7523_MUX_TADC,  (get_chip_scu_data(EN7523_MUX_TADC) &(~(0x7f <<0)) ) | (0x70<<0) );
++ 	regmap_read(priv->chip_scu, EN7523_MUX_TADC, &val);
++-	val &= (~(0x7f <<0)) | (0x70<<0);
+++	val = (val & ~(0x7f << 0)) | (0x70 << 0);
++ 	regmap_write(priv->chip_scu, EN7523_MUX_TADC, val);
++ 
++ 	// Get Pkg info
++@@ -847,10 +848,17 @@
++ 
++ static int en7523_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
++ {
++-	struct airoha_thermal_priv *priv = thermal_zone_device_priv(tz);
+++	/* the zone, not priv, is the thermal zone's devdata */
+++	struct airoha_thermal_zone *zone = thermal_zone_device_priv(tz);
+++	struct airoha_thermal_priv *priv = zone->priv;
++ 	int adc_val, temp_x10;
++ 	adc_val = airoha_get_thermal_ADC(priv);
++-	temp_x10 = 1000 * (adc_val - priv->default_offset) / priv->default_slope + 300;
+++	/* Stock thermal.ko ThermalGetT() (EN7523, HIR 12):
+++	 *   T[0.1 C] = 50 * (adc - cal) / 101 + 250
+++	 * cal comes from get_ptp_dummy(), 0x86d3 when that is not programmed.
+++	 * The E2/E3 slope/offset constants used before gave ~1100 C here.
+++	 */
+++	temp_x10 = 50 * (adc_val - EN7523_STOCK_TADC_CAL) / 101 + 250;
++ 	*temp = temp_x10 * 100;
++ 	return 0;
++ }
++@@ -942,6 +950,8 @@
++ };
++ 
++ static const struct airoha_thermal_soc_data en7523_data = {
+++	/* without it no thermal zone is registered at all */
+++	.num_sensors = 1,
++ 	.pllrg_protect_key = AN7583_SCU_THERMAL_PROTECT_KEY,
++ 	.pllrg_protect = EN7523_PLLRG_PROTECT,
++ 	.thdev_ops = &en7523_thdev_ops,
