@@ -17,8 +17,8 @@ the stock firmware stays on the device and can be booted again with one U-Boot c
 
 Working: 3x LAN + WAN (Gigabit), Wi-Fi 2.4 GHz + 5 GHz (HE160), LuCI, USB storage, correct
 MAC address and Wi-Fi calibration from flash, wired hardware NAT (PPE flow offload), Wi-Fi
-offload the way the stock firmware does it (NPU for Wi-Fi RX, WED for Wi-Fi TX, PPE-bound
-flows to Wi-Fi), sysupgrade (also from LuCI), boot from flash without a PC.
+offload the way the stock firmware does it (PPE -> WDMA -> WED for downloads, NPU for Wi-Fi
+RX), sysupgrade (also from LuCI), boot from flash without a PC.
 
 Prebuilt images are on the [Releases](../../releases/latest) page.
 
@@ -51,7 +51,7 @@ data from `misc` + `0x100000` (4 KiB). Nothing unit-specific has to be copied by
 | LAN 1-3 / WAN | ✅ |
 | Wi-Fi 2.4 GHz (HE20) / 5 GHz (HE160, 2401 Mbit/s link) | ✅ |
 | Wired NAT hardware offload (PPE) | ✅ ~890 Mbit/s routed, CPU 1-7 % |
-| Wi-Fi offload (NPU RX, WED TX, PPE fast path) | ✅ 2 GB download to a phone at ~58-70 MB/s, CPU ~65-75 % per core, no core at 100 % |
+| Wi-Fi download offload (PPE -> WDMA -> WED) | ✅ ~100 MB/s to a 5 GHz client, CPU 6-12 % |
 | NPU (4x RV32, OpenNPU firmware) | ✅ Wi-Fi RX offload for the MT7916 |
 | USB storage (ext4, vfat, exFAT, NTFS3) | ✅ |
 | LuCI | ✅ |
@@ -228,14 +228,17 @@ and `mt7916_ap.ko`), see [docs/wifi-offload.md](docs/wifi-offload.md):
 - **Wi-Fi to WAN (upload):** the NPU reads the MT7916 RX ring, reorders block-ack
   sessions and pushes frames into the PPE through QDMA0 TX ring 6. Bound flows leave on the
   WAN port without touching the ARM cores.
-- **WAN to Wi-Fi (download):** the PPE binds the flow (NAT, L2 rewrite) and hands it to the
-  CPU on CDM1; a short fast path in `airoha_eth` queues it straight to the Wi-Fi device
-  (no GRO, routing or netfilter), and mt76 transmits it through the WED TX ring. The stock
-  firmware does the same (`dp=0` + `PpeWifiFastTxHandler`); it does not bind Wi-Fi flows
-  PPE -> WDMA.
+- **WAN to Wi-Fi (download):** the PPE binds the flow and sends it to WDMA; WED writes it
+  into the MT7916 TX ring over PCIe. No CPU involved: ~100 MB/s at 6-12 % CPU. The FOE
+  entry uses the stock WHNAT layout (decoded from the stock `hw_nat.ko`/`mt_whnat.ko`).
+  Fallback: `echo 0 > /sys/module/airoha_eth/parameters/en7523_wdma_bind` hands bound
+  flows to a CPU fast path instead (~60 MB/s, ~70 % CPU).
 
-Fast path counters: `/sys/module/airoha_eth/parameters/en7523_wifi_fp_*`. NPU: 
-`/sys/kernel/debug/airoha_npu/`, `dmesg | grep "NPU RX"`.
+| Downstream mode | Throughput | CPU |
+|---|---|---|
+| PPE -> WDMA -> WED (default) | 92-106 MB/s | both cores 6-12 % |
+| CDM1 fast path | 57-67 MB/s | both cores ~70 % |
+| software forwarding | ~60 MB/s | one core 100 % |
 
 ## Building from source
 
@@ -253,7 +256,7 @@ The release was built from the
    - `9992` WED: MT7916 WPDMA base on EN7523, TXD size check
    - `9993` NPU: allow `HWNAT_INIT` for the OpenNPU firmware
    - `9994` reserve QDMA0 TX ring 6 / TX IRQ queue 1 for the NPU
-   - `9995` Wi-Fi flows use the CDM1 fast path, bridge with a Wi-Fi port counts as Wi-Fi
+   - `9995` PPE -> WDMA -> WED binding with the stock WHNAT FOE layout (runtime knobs)
    - mt76 `0302` (NPU build fixes), mac80211 `423` (forward path for APs without a
      hardware path)
 3. Optional: copy [`files/`](files) to the tree root for the defaults listed above.

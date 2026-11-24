@@ -1,3 +1,4 @@
+ A target/linux/airoha/patches-6.18/9995-net-airoha-en7523-whnat-wifi-flows-ppe-wdma-wed.patch
 diff --git a/package/kernel/mac80211/patches/subsys/423-mac80211-fill-forward-path-for-AP-without-hardware-path.patch b/package/kernel/mac80211/patches/subsys/423-mac80211-fill-forward-path-for-AP-without-hardware-path.patch
 new file mode 100644
 index 0000000..d22e28a
@@ -922,24 +923,54 @@ index 0000000..5c9eebe
 + 	airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
 + 			  GLOBAL_CFG_TX_DMA_EN_MASK |
 + 			  GLOBAL_CFG_RX_DMA_EN_MASK);
-diff --git a/target/linux/airoha/patches-6.18/9995-net-airoha-en7523-wifi-flows-default-to-cdm1-fastpath.patch b/target/linux/airoha/patches-6.18/9995-net-airoha-en7523-wifi-flows-default-to-cdm1-fastpath.patch
+diff --git a/target/linux/airoha/patches-6.18/9995-net-airoha-en7523-whnat-wifi-flows-ppe-wdma-wed.patch b/target/linux/airoha/patches-6.18/9995-net-airoha-en7523-whnat-wifi-flows-ppe-wdma-wed.patch
 new file mode 100644
-index 0000000..760ad71
+index 0000000..196d90d
 --- /dev/null
-+++ b/target/linux/airoha/patches-6.18/9995-net-airoha-en7523-wifi-flows-default-to-cdm1-fastpath.patch
-@@ -0,0 +1,83 @@
++++ b/target/linux/airoha/patches-6.18/9995-net-airoha-en7523-whnat-wifi-flows-ppe-wdma-wed.patch
+@@ -0,0 +1,145 @@
 +--- a/drivers/net/ethernet/airoha/airoha_ppe.c	2026-11-24 06:35:22.404500568 +0300
-++++ b/drivers/net/ethernet/airoha/airoha_ppe.c	2026-11-24 07:13:37.265052424 +0300
-+@@ -678,6 +678,41 @@
+++++ b/drivers/net/ethernet/airoha/airoha_ppe.c	2026-11-24 08:23:39.063190440 +0300
++@@ -551,6 +551,7 @@
++ 		return -EINVAL;
++ 
++ 	info->idx = path->mtk_wdma.wdma_idx;
+++	info->queue = path->mtk_wdma.queue;
++ 	info->bss = path->mtk_wdma.bss;
++ 	info->wcid = path->mtk_wdma.wcid;
++ 
++@@ -678,6 +679,63 @@
 + 	return NULL;
 + }
 + 
-++/* EN7523: bind WiFi flows to WDMA (WED). The PPE->WDMA hand-off does not
-++ * deliver frames yet, so by default such flows use the CDM1 fast path.
+++/* EN7523: bind WiFi flows PPE -> WDMA -> WED like the stock WHNAT driver.
+++ * Cleared, such flows use the CDM1 fast path instead.
 ++ */
-++static bool en7523_wdma_bind;
+++static bool en7523_wdma_bind = true;
 ++module_param(en7523_wdma_bind, bool, 0644);
-++MODULE_PARM_DESC(en7523_wdma_bind, "EN7523: bind WiFi flows to WDMA instead of the CDM1 fast path");
+++MODULE_PARM_DESC(en7523_wdma_bind, "EN7523: bind WiFi flows to WDMA (default) instead of the CDM1 fast path");
+++
+++/* EN7523 WHNAT FOE layout, from the stock hw_nat.ko (PpeSetPortInfo with the
+++ * WHNAT magic 0x7615, as filled by mt_whnat.ko wifi_tx_tuple_add()):
+++ *   ring = band | wdma_idx << 1
+++ *   ib2:  PSE port 3, PSE_QOS, NBQ = ring
+++ *   data: CHANNEL = 6 + ring, SHAPER_ID = 0x7f
+++ *   l2.etype (WINFO) = bss | wcid << 6
+++ * The knobs below allow the other stock variants to be tried at run time.
+++ */
+++static int en7523_wdma_port = FE_PSE_PORT_GDM3;
+++module_param(en7523_wdma_port, int, 0644);
+++static int en7523_wdma_qos = 1;
+++module_param(en7523_wdma_qos, int, 0644);
+++static int en7523_wdma_nbq_base;
+++module_param(en7523_wdma_nbq_base, int, 0644);
+++static int en7523_wdma_chan_base = 6;
+++module_param(en7523_wdma_chan_base, int, 0644);
+++static int en7523_wdma_shaper = 0x7f;
+++module_param(en7523_wdma_shaper, int, 0644);
+++static int en7523_wdma_winfo = 1;
+++module_param(en7523_wdma_winfo, int, 0644);
+++MODULE_PARM_DESC(en7523_wdma_winfo, "EN7523 WINFO format: 1 = bss | wcid << 6 (stock), 0 = band/wcid");
 ++
 ++static int airoha_en7523_lower_is_wifi(struct net_device *dev,
 ++				       struct netdev_nested_priv *priv)
@@ -972,7 +1003,7 @@ index 0000000..760ad71
 + static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
 + 					struct airoha_foe_entry *hwe,
 + 					struct net_device *netdev, int type,
-+@@ -710,7 +745,8 @@
++@@ -710,22 +768,44 @@
 + 	if (netdev) {
 + 		struct airoha_wdma_info info = {};
 + 
@@ -980,18 +1011,50 @@ index 0000000..760ad71
 ++		if ((!airoha_is(eth, airoha_en7523) || en7523_wdma_bind) &&
 ++		    !airoha_ppe_get_wdma_info(netdev, data->eth.h_dest,
 + 					      &info)) {
+++			if (airoha_is(eth, airoha_en7523)) {
+++				u8 ring = (info.queue & 1) | (info.idx & 1) << 1;
+++
+++				val |= FIELD_PREP(AIROHA_FOE_IB2_NBQ,
+++						  en7523_wdma_nbq_base + ring) |
+++				       FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT,
+++						  en7523_wdma_port);
+++				if (en7523_wdma_qos)
+++					val |= AIROHA_FOE_IB2_PSE_QOS;
+++				qdata |= FIELD_PREP(AIROHA_FOE_CHANNEL,
+++						    en7523_wdma_chan_base + ring) |
+++					 FIELD_PREP(AIROHA_FOE_SHAPER_ID,
+++						    en7523_wdma_shaper);
+++				wlan_etype = en7523_wdma_winfo ?
+++					     (info.bss & 0x3f) | info.wcid << 6 :
+++					     FIELD_PREP(AIROHA_FOE_MAC_WDMA_BAND,
+++							info.idx) |
+++					     FIELD_PREP(AIROHA_FOE_MAC_WDMA_WCID,
+++							info.wcid);
+++				if (en7523_wifi_fastpath == 2)
+++					pr_info("en7523 wdma bind: wed=%d band=%d bss=%d wcid=%d ib2=%08x data=%08x winfo=%04x\n",
+++						info.idx, info.queue, info.bss,
+++						info.wcid, val, qdata, wlan_etype);
+++			} else {
 + 			val |= FIELD_PREP(AIROHA_FOE_IB2_NBQ, info.idx) |
 + 			       FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT,
-+@@ -725,7 +761,7 @@
++-					  airoha_is(eth, airoha_en7523) ?
++-					  FE_PSE_PORT_GDM3 :
++ 					  FE_PSE_PORT_CDM4);
++-			if (airoha_is(eth, airoha_en7523))
++-				val |= AIROHA_FOE_IB2_PSE_QOS;
++ 			qdata |= FIELD_PREP(AIROHA_FOE_ACTDP, info.bss);
++ 			wlan_etype = FIELD_PREP(AIROHA_FOE_MAC_WDMA_BAND,
++ 						info.idx) |
 + 				     FIELD_PREP(AIROHA_FOE_MAC_WDMA_WCID,
 + 						info.wcid);
+++			}
 + 		} else if (airoha_is(eth, airoha_en7523) && en7523_wifi_fastpath &&
 +-			   netdev->ieee80211_ptr) {
 ++			   airoha_en7523_is_wifi_odev(netdev)) {
 + 			/* EN7523 has no PSE path towards WDMA and WED does not
 + 			 * work with MT7916 here: bind the flow anyway (NAT,
 + 			 * VLAN/PPPoE decap and L2 rewrite done by the PPE) and
-+@@ -2041,6 +2077,10 @@
++@@ -2041,6 +2121,10 @@
 + 
 + 	err = airoha_ppe_foe_entry_prepare(eth, &hwe, odev, offload_type,
 + 					   &data, l4proto, dsfield);
@@ -1002,7 +1065,7 @@ index 0000000..760ad71
 + 	if (err)
 + 		return err;
 + 
-+@@ -2119,7 +2159,7 @@
++@@ -2119,7 +2203,7 @@
 + 	e->cookie = f->cookie;
 + 	memcpy(&e->data, &hwe, sizeof(e->data));
 + 	if (airoha_is(eth, airoha_en7523) && en7523_wifi_fastpath &&
