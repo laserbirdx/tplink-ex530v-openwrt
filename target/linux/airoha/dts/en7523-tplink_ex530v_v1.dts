@@ -292,7 +292,13 @@ New Maping:
 };
 
 &npu {
-	status = "disabled";
+	/* the driver matches the vendor-namespaced compatible (patch 930-228)
+	 * but en7523.dtsi still carries the old one, so the NPU never bound */
+	compatible = "airoha,airoha_en7523-npu";
+	status = "okay";
+
+	firmware-name = "airoha/en7523_kite_npu_rv32.bin",
+			"airoha/en7523_kite_npu_data.bin";
 };
 
 &usb0 {

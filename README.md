@@ -16,8 +16,9 @@ OpenWrt is installed into the **empty second firmware slot** and an unused NAND 
 the stock firmware stays on the device and can be booted again with one U-Boot command.
 
 Working: 3x LAN + WAN (Gigabit), Wi-Fi 2.4 GHz + 5 GHz (HE160), LuCI, USB storage, correct
-MAC address and Wi-Fi calibration from flash, wired hardware NAT (PPE flow offload),
-sysupgrade (also from LuCI), boot from flash without a PC.
+MAC address and Wi-Fi calibration from flash, wired hardware NAT (PPE flow offload), Wi-Fi
+offload the way the stock firmware does it (NPU for Wi-Fi RX, WED for Wi-Fi TX, PPE-bound
+flows to Wi-Fi), sysupgrade (also from LuCI), boot from flash without a PC.
 
 Prebuilt images are on the [Releases](../../releases/latest) page.
 
@@ -50,9 +51,11 @@ data from `misc` + `0x100000` (4 KiB). Nothing unit-specific has to be copied by
 | LAN 1-3 / WAN | ✅ |
 | Wi-Fi 2.4 GHz (HE20) / 5 GHz (HE160, 2401 Mbit/s link) | ✅ |
 | Wired NAT hardware offload (PPE) | ✅ ~890 Mbit/s routed, CPU 1-7 % |
+| Wi-Fi offload (NPU RX, WED TX, PPE fast path) | ✅ 2 GB download to a phone at ~58-70 MB/s, CPU ~65-75 % per core, no core at 100 % |
+| NPU (4x RV32, OpenNPU firmware) | ✅ Wi-Fi RX offload for the MT7916 |
 | USB storage (ext4, vfat, exFAT, NTFS3) | ✅ |
 | LuCI | ✅ |
-| xPON / NPU | disabled |
+| xPON | disabled |
 | LEDs, buttons | not tested |
 
 ## Default configuration of the release image
@@ -64,6 +67,7 @@ data from `misc` + `0x100000` (4 KiB). Nothing unit-specific has to be copied by
 | Login | `root`, **no password** |
 | Wi-Fi | **enabled and open (no password)**: `EX530v-OpenWrt-2G` (ch 1, HE20) and `EX530v-OpenWrt-5G` (ch 36, HE160), country `TR` |
 | Flow offload | software + hardware flow offloading enabled |
+| Wi-Fi offload | `options mt7915e wed_enable=1` (WED on, required by the NPU), NPU firmware `en7523_kite_npu_*.bin` |
 
 > **Right after the first boot:** set a root password and Wi-Fi passwords. Until you do,
 > anyone in range can join the open Wi-Fi and log in as root.
@@ -216,6 +220,23 @@ mtd9: 00040000 00040000 "bootflag"
 
 How the vendor U-Boot chooses a slot is described in [docs/u-boot.md](docs/u-boot.md).
 
+## Wi-Fi datapath (NPU + WED)
+
+Same split as the stock firmware (worked out from its `hw_nat.ko`, `mt_whnat.ko`, `npu.ko`
+and `mt7916_ap.ko`), see [docs/wifi-offload.md](docs/wifi-offload.md):
+
+- **Wi-Fi to WAN (upload):** the NPU reads the MT7916 RX ring, reorders block-ack
+  sessions and pushes frames into the PPE through QDMA0 TX ring 6. Bound flows leave on the
+  WAN port without touching the ARM cores.
+- **WAN to Wi-Fi (download):** the PPE binds the flow (NAT, L2 rewrite) and hands it to the
+  CPU on CDM1; a short fast path in `airoha_eth` queues it straight to the Wi-Fi device
+  (no GRO, routing or netfilter), and mt76 transmits it through the WED TX ring. The stock
+  firmware does the same (`dp=0` + `PpeWifiFastTxHandler`); it does not bind Wi-Fi flows
+  PPE -> WDMA.
+
+Fast path counters: `/sys/module/airoha_eth/parameters/en7523_wifi_fp_*`. NPU: 
+`/sys/kernel/debug/airoha_npu/`, `dmesg | grep "NPU RX"`.
+
 ## Building from source
 
 The release was built from the
@@ -227,7 +248,14 @@ The release was built from the
 2. Apply [`openwrt/airoha-ex530v.diff`](openwrt/airoha-ex530v.diff) (`git apply`): image
    recipe (TP-Link slot B header, NAND sysupgrade tar), sysupgrade handler (UBI format on
    first install, vendor boot flag), forced kernel command line, network setup, kernel
-   text offset patch.
+   text offset patch, and the Wi-Fi offload patches:
+   - `9991` Wi-Fi fast path (PPE-bound flows from CDM1 straight to the Wi-Fi device)
+   - `9992` WED: MT7916 WPDMA base on EN7523, TXD size check
+   - `9993` NPU: allow `HWNAT_INIT` for the OpenNPU firmware
+   - `9994` reserve QDMA0 TX ring 6 / TX IRQ queue 1 for the NPU
+   - `9995` Wi-Fi flows use the CDM1 fast path, bridge with a Wi-Fi port counts as Wi-Fi
+   - mt76 `0302` (NPU build fixes), mac80211 `423` (forward path for APs without a
+     hardware path)
 3. Optional: copy [`files/`](files) to the tree root for the defaults listed above.
 4. `cp openwrt/diffconfig .config && make defconfig && make -j$(nproc)`.
 
@@ -244,6 +272,7 @@ sysupgrade image, for manual flashing.
 | `openwrt/diffconfig` | build configuration |
 | `files/` | first-boot defaults used in the release image |
 | `docs/u-boot.md` | vendor U-Boot: slot selection, image header, boot flags |
+| `docs/wifi-offload.md` | stock vs. OpenWrt Wi-Fi datapath, NPU bring-up notes |
 
 ## License
 

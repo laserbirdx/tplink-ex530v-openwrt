@@ -1,0 +1,7 @@
+#!/bin/sh
+# EX530v: fw4 builds the hw-offload flowtable from the bridge's lower devices at
+# load time. The AP netdevs join br-lan later (DFS CAC on 160 MHz can take 60 s),
+# so re-resolve the flowtable once a wireless AP interface appears.
+[ "$ACTION" = add ] || exit 0
+case "$INTERFACE" in phy*-ap*) ;; *) exit 0 ;; esac
+( sleep 15; /etc/init.d/firewall reload ) >/dev/null 2>&1 &

@@ -1,0 +1,8 @@
+#!/bin/sh
+# EX530v: the NPU WiFi RX offload needs the MT7916 attached to WED
+# (wed_enable=0 with the NPU running leaves the APs deaf). /etc/modules.conf
+# is kept across sysupgrade, so fix configs from older images here.
+grep -q "^options mt7915e" /etc/modules.conf 2>/dev/null &&
+	sed -i "s/^options mt7915e .*/options mt7915e wed_enable=1/" /etc/modules.conf ||
+	echo "options mt7915e wed_enable=1" >> /etc/modules.conf
+exit 0
